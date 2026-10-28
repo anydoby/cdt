@@ -193,6 +193,22 @@ public class CoreBuildLaunchBarTrackerTests extends BaseTestCase5 {
 		assertThat("Caller failed: " + callerError.get(), callerError.get(), is((Throwable) null)); //$NON-NLS-1$
 	}
 
+	/**
+	 * A status change of a target that is not selected must not change the active build
+	 * configuration.
+	 */
+	@Test
+	public void statusOfOtherTargetDoesNotChangeActiveConfig() throws Exception {
+		addOtherTarget();
+		launchBarManager.setActiveLaunchTarget(localTarget);
+		waitForLaunchBarTracker();
+
+		launchTargetManager.targetStatusChanged(otherTarget);
+		waitForLaunchBarTracker();
+
+		assertThat(activeConfig(), is(ILaunchManager.RUN_MODE + '/' + localTarget.getId()));
+	}
+
 	private ILaunchTarget addOtherTarget() {
 		otherTarget = launchTargetManager.addLaunchTarget(ILaunchTargetManager.localLaunchTargetTypeId,
 				"trackerTestTarget"); //$NON-NLS-1$

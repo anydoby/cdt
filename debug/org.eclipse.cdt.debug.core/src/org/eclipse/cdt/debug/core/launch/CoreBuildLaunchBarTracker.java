@@ -259,6 +259,9 @@ public class CoreBuildLaunchBarTracker implements ILaunchBarListener, ILaunchTar
 	@Override
 	public void launchTargetStatusChanged(ILaunchTarget target) {
 		try {
+			if (!target.equals(launchBarManager.getActiveLaunchTarget())) {
+				return;
+			}
 			if (targetManager.getStatus(target).equals(TargetStatus.OK_STATUS)) {
 				// Now that we have access to the target, it may change what the build config
 				ILaunchMode mode = launchBarManager.getActiveLaunchMode();
