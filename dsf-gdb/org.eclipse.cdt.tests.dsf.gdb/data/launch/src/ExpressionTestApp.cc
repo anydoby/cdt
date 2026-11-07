@@ -456,6 +456,22 @@ void testExistingChild() {
 	return;
 }
 
+int testShadowing(int x) { /* testShadowing_arg */
+	int y = x + 1;
+	{
+		int x = 20; /* testShadowing_x20 */
+		{
+			int x = 30;
+			/* testShadowing_inner */
+			y = x;
+		}
+		y = y + x;
+		/* testShadowing_outer */
+		y = y + 1;
+	}
+	return y;
+}
+
 int main() {
     printf("Running ExpressionTest App\n");
 
@@ -486,6 +502,7 @@ int main() {
     testCasting();
     testReturn();
     testExistingChild();
+    testShadowing(10);
     
     // For bug 320277
     BaseTest b; b.test();

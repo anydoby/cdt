@@ -20,6 +20,7 @@ import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.util.Arrays;
 import java.util.HashMap;
@@ -587,6 +588,82 @@ public class MIExpressionsTest extends BaseParametrizedTestCase {
 		String actualDecimalValue = readQuery.get().getFormattedValue();
 
 		assertThat(actualDecimalValue.toLowerCase(), is(newValueInDecimal.toLowerCase()));
+	}
+
+	/**
+	 * Returns the display name and the decimal value of each local variable of a frame.
+	 */
+	private Map<String, String> getLocalsByDisplayName(IFrameDMContext frameDmc) throws Throwable {
+		Map<String, String> result = new LinkedHashMap<>();
+		for (IVariableDMData variable : SyncUtil.getLocals(frameDmc)) {
+			IExpressionDMContext exprDmc = SyncUtil.createExpression(frameDmc, variable.getName());
+			Query<IExpressionDMData> query = new Query<>() {
+				@Override
+				protected void execute(DataRequestMonitor<IExpressionDMData> rm) {
+					fExpService.getExpressionData(exprDmc, rm);
+				}
+			};
+			fSession.getExecutor().execute(query);
+			String name = query.get(TestsPlugin.massageTimeout(500), TimeUnit.MILLISECONDS).getName();
+			result.put(name, SyncUtil.getExpressionValue(exprDmc, IFormattedValues.DECIMAL_FORMAT));
+		}
+		return result;
+	}
+
+	/**
+	 * Returns the expression of the local variable that has this display name.
+	 */
+	private IExpressionDMContext getLocalByDisplayName(IFrameDMContext frameDmc, String displayName) throws Throwable {
+		for (IVariableDMData variable : SyncUtil.getLocals(frameDmc)) {
+			IExpressionDMContext exprDmc = SyncUtil.createExpression(frameDmc, variable.getName());
+			Query<IExpressionDMData> query = new Query<>() {
+				@Override
+				protected void execute(DataRequestMonitor<IExpressionDMData> rm) {
+					fExpService.getExpressionData(exprDmc, rm);
+				}
+			};
+			fSession.getExecutor().execute(query);
+			if (displayName.equals(query.get(TestsPlugin.massageTimeout(500), TimeUnit.MILLISECONDS).getName())) {
+				return exprDmc;
+			}
+		}
+		fail("No local variable " + displayName);
+		return null;
+	}
+
+	/**
+	 * This test verifies that we show variables that a variable with the same
+	 * name in an inner scope hides, with their own values, and that we can
+	 * change them.
+	 */
+	@Test
+	public void testShadowedVariables() throws Throwable {
+		String argument = "x (line " + getLineForTag("testShadowing_arg") + ")";
+		String x20 = "x (line " + getLineForTag("testShadowing_x20") + ")";
+
+		MIStoppedEvent stoppedEvent = runToTag("testShadowing_inner");
+		IFrameDMContext frameDmc = SyncUtil.getStackFrame(stoppedEvent.getDMContext(), 0);
+
+		Map<String, String> expected = new LinkedHashMap<>();
+		expected.put(argument, "10");
+		expected.put("x", "30");
+		expected.put(x20, "20");
+		expected.put("y", "11");
+		assertEquals(expected, getLocalsByDisplayName(frameDmc));
+
+		// Change the hidden variables
+		writeAndCheck(getLocalByDisplayName(frameDmc, x20), "25", IFormattedValues.DECIMAL_FORMAT, "25");
+		writeAndCheck(getLocalByDisplayName(frameDmc, argument), "7", IFormattedValues.DECIMAL_FORMAT, "7");
+
+		// The program uses the new values: y = 30 + 25
+		stoppedEvent = runToTag("testShadowing_outer");
+		frameDmc = SyncUtil.getStackFrame(stoppedEvent.getDMContext(), 0);
+
+		expected = new LinkedHashMap<>();
+		expected.put(argument, "7");
+		expected.put("x", "25");
+		expected.put("y", "55");
+		assertEquals(expected, getLocalsByDisplayName(frameDmc));
 	}
 
 	/**

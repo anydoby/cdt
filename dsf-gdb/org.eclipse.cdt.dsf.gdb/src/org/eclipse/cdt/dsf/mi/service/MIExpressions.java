@@ -51,6 +51,7 @@ import org.eclipse.cdt.dsf.debug.service.IRunControl.IExitedDMEvent;
 import org.eclipse.cdt.dsf.debug.service.IRunControl.IResumedDMEvent;
 import org.eclipse.cdt.dsf.debug.service.IRunControl.ISuspendedDMEvent;
 import org.eclipse.cdt.dsf.debug.service.IRunControl.StateChangeReason;
+import org.eclipse.cdt.dsf.debug.service.IStack;
 import org.eclipse.cdt.dsf.debug.service.IStack.IFrameDMContext;
 import org.eclipse.cdt.dsf.debug.service.command.CommandCache;
 import org.eclipse.cdt.dsf.debug.service.command.ICommandControlService;
@@ -1171,6 +1172,12 @@ public class MIExpressions extends AbstractDsfService implements IMIExpressions,
 
 							String relativeExpr = getData().getExpr();
 							String alias = fReturnValueAliases.getAlias(relativeExpr);
+							if (alias == null) {
+								MIStack.ShadowedExpression shadowed = getShadowedExpression(relativeExpr);
+								if (shadowed != null) {
+									alias = shadowed.fAlias;
+								}
+							}
 							if (alias != null) {
 								relativeExpr = alias;
 							}
@@ -1575,6 +1582,15 @@ public class MIExpressions extends AbstractDsfService implements IMIExpressions,
 
 	@Override
 	public void canWriteExpression(IExpressionDMContext dmc, final DataRequestMonitor<Boolean> rm) {
+		MIStack.ShadowedExpression shadowed = dmc instanceof MIExpressionDMC
+				? getShadowedExpression(((MIExpressionDMC) dmc).getExpression())
+				: null;
+		if (shadowed != null && shadowed.fReadOnly) {
+			// The expression holds a copy of the value of a shadowed variable
+			rm.done(false);
+			return;
+		}
+
 		if (dmc instanceof MIExpressionDMC) {
 			fExpressionCache.execute(new ExprMetaGetAttributes(dmc),
 					new DataRequestMonitor<ExprMetaGetAttributesInfo>(getExecutor(), rm) {
@@ -1820,6 +1836,18 @@ public class MIExpressions extends AbstractDsfService implements IMIExpressions,
 	/* (non-Javadoc)
 	 * @see org.eclipse.cdt.dsf.debug.service.IExpressions3#getExpressionDataExtension(org.eclipse.cdt.dsf.debug.service.IExpressions.IExpressionDMContext, org.eclipse.cdt.dsf.concurrent.DataRequestMonitor)
 	 */
+	/**
+	 * @return The data of an expression that MIStack made for a shadowed variable,
+	 *         or null if the expression is not one of these.
+	 */
+	private MIStack.ShadowedExpression getShadowedExpression(String expression) {
+		IStack stack = getServicesTracker().getService(IStack.class);
+		if (stack instanceof MIStack) {
+			return ((MIStack) stack).getShadowedExpression(expression);
+		}
+		return null;
+	}
+
 	/** @since 4.0 */
 	@Override
 	public void getExpressionDataExtension(IExpressionDMContext dmc,

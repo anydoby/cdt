@@ -27,6 +27,10 @@ class Messages extends NLS {
 	public static String Breakpoint_installation_failed;
 	public static String MIExpressions_NotAvailableBecauseChildOfDynamicVarobj;
 	public static String MIExpressions_ReturnValueAlias;
+	public static String MIStack_ShadowedArgument;
+	public static String MIStack_ShadowedVariable;
+	public static String MIStack_ShadowedVariableLine;
+	public static String MIStack_ShadowedVariableNumber;
 	public static String MIRegisters_General_Registers;
 	public static String MIRegisters_General_Registers_description;
 

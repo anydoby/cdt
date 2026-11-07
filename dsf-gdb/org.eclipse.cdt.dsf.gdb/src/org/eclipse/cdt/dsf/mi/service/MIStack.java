@@ -19,10 +19,12 @@ package org.eclipse.cdt.dsf.mi.service;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Hashtable;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 import org.eclipse.cdt.core.IAddress;
 import org.eclipse.cdt.dsf.concurrent.CountingRequestMonitor;
@@ -48,12 +50,19 @@ import org.eclipse.cdt.dsf.debug.service.command.ICommand;
 import org.eclipse.cdt.dsf.debug.service.command.ICommandControlService;
 import org.eclipse.cdt.dsf.gdb.internal.GdbPlugin;
 import org.eclipse.cdt.dsf.gdb.service.IGDBTraceControl.ITraceRecordSelectedChangedDMEvent;
+import org.eclipse.cdt.dsf.gdb.service.command.IGDBControl;
 import org.eclipse.cdt.dsf.mi.service.command.CommandFactory;
 import org.eclipse.cdt.dsf.mi.service.command.events.IMIDMEvent;
 import org.eclipse.cdt.dsf.mi.service.command.events.MIFunctionFinishedEvent;
 import org.eclipse.cdt.dsf.mi.service.command.events.MIStoppedEvent;
+import org.eclipse.cdt.dsf.mi.service.command.commands.MIInterpreterExecConsole;
 import org.eclipse.cdt.dsf.mi.service.command.output.MIArg;
+import org.eclipse.cdt.dsf.mi.service.command.output.MIConsoleStreamOutput;
+import org.eclipse.cdt.dsf.mi.service.command.output.MIDataEvaluateExpressionInfo;
 import org.eclipse.cdt.dsf.mi.service.command.output.MIFrame;
+import org.eclipse.cdt.dsf.mi.service.command.output.MIInfo;
+import org.eclipse.cdt.dsf.mi.service.command.output.MIOOBRecord;
+import org.eclipse.cdt.dsf.mi.service.command.output.MIOutput;
 import org.eclipse.cdt.dsf.mi.service.command.output.MIStackInfoDepthInfo;
 import org.eclipse.cdt.dsf.mi.service.command.output.MIStackListArgumentsInfo;
 import org.eclipse.cdt.dsf.mi.service.command.output.MIStackListFramesInfo;
@@ -112,11 +121,22 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 
 		private final Type fType;
 		private final int fIndex;
+		private final int fShadowIndex;
 
 		public MIVariableDMC(MIStack service, IFrameDMContext frame, Type type, int index) {
+			this(service, frame, type, index, 0);
+		}
+
+		/**
+		 * @param shadowIndex 0 if the variable is visible, else the number of
+		 *            variables in inner scopes that have the same name.
+		 * @since 7.4
+		 */
+		public MIVariableDMC(MIStack service, IFrameDMContext frame, Type type, int index, int shadowIndex) {
 			super(service, new IDMContext[] { frame });
 			fIndex = index;
 			fType = type;
+			fShadowIndex = shadowIndex;
 		}
 
 		public int getIndex() {
@@ -127,6 +147,15 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 			return fType;
 		}
 
+		/**
+		 * @return 0 if the variable is visible, else the number of variables
+		 *         in inner scopes that have the same name.
+		 * @since 7.4
+		 */
+		public int getShadowIndex() {
+			return fShadowIndex;
+		}
+
 		@Override
 		public boolean equals(Object other) {
 			if (!(other instanceof MIVariableDMC)) {
@@ -134,7 +163,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 			}
 
 			return super.baseEquals(other) && ((MIVariableDMC) other).fType == fType
-					&& ((MIVariableDMC) other).fIndex == fIndex;
+					&& ((MIVariableDMC) other).fIndex == fIndex && ((MIVariableDMC) other).fShadowIndex == fShadowIndex;
 		}
 
 		@Override
@@ -147,12 +176,13 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 			} else if (fType == Type.RETURN_VALUES) {
 				typeFactor = 4;
 			}
-			return super.baseHashCode() ^ typeFactor ^ fIndex;
+			return super.baseHashCode() ^ typeFactor ^ fIndex ^ (fShadowIndex << 16);
 		}
 
 		@Override
 		public String toString() {
-			return baseToString() + ".variable(" + fType + ")[" + fIndex + "]"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+			return baseToString() + ".variable(" + fType + ")[" + fIndex + "]" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+					+ (fShadowIndex > 0 ? ".shadow[" + fShadowIndex + "]" : ""); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
 		}
 	}
 
@@ -180,6 +210,148 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 		@Override
 		public String toString() {
 			return fMIArg.toString();
+		}
+	}
+
+	/**
+	 * Data of a shadowed variable. The name is a GDB expression that refers to
+	 * this variable and not to the visible variable with the same name.
+	 */
+	private static class ShadowedVariableData extends VariableData {
+		private final String fExpression;
+
+		public ShadowedVariableData(MIArg arg, String expression) {
+			super(arg);
+			fExpression = expression;
+		}
+
+		@Override
+		public String getName() {
+			return fExpression;
+		}
+	}
+
+	/**
+	 * Display name and write access of an expression made for a shadowed variable.
+	 */
+	static class ShadowedExpression {
+		final String fAlias;
+		final boolean fReadOnly;
+
+		ShadowedExpression(String alias, boolean readOnly) {
+			fAlias = alias;
+			fReadOnly = readOnly;
+		}
+	}
+
+	/** Start of the GDB convenience variables made for shadowed variables. */
+	private static final String SHADOW_VARIABLE_PREFIX = "$_cdt_shadow_"; //$NON-NLS-1$
+
+	/** Start of each line that {@link #SHADOW_HELPER} prints. */
+	private static final String SHADOW_HELPER_TAG = "cdt-shadow|"; //$NON-NLS-1$
+
+	/**
+	 * GDB Python command that lists the variables of the selected frame, innermost
+	 * scope first (the order of -stack-list-locals). For each variable in memory, it
+	 * sets a convenience variable to the address of the variable. Each line is
+	 * "cdt-shadow|name|declaration line|1 if argument|convenience variable or empty".
+	 */
+	private static final String SHADOW_HELPER = "python exec('" //$NON-NLS-1$
+			+ "import gdb\\n" //$NON-NLS-1$
+			+ "f=gdb.selected_frame()\\n" //$NON-NLS-1$
+			+ "b=f.block()\\n" //$NON-NLS-1$
+			+ "while b is not None:\\n" //$NON-NLS-1$
+			+ " for s in b:\\n" //$NON-NLS-1$
+			+ "  if s.is_variable or s.is_argument:\\n" //$NON-NLS-1$
+			+ "   k=\"\"\\n" //$NON-NLS-1$
+			+ "   try:\\n" //$NON-NLS-1$
+			+ "    a=s.value(f).address\\n" //$NON-NLS-1$
+			+ "    if a is not None:\\n" //$NON-NLS-1$
+			+ "     k=\"_cdt_shadow_%x\" % int(a)\\n" //$NON-NLS-1$
+			+ "     gdb.set_convenience_variable(k,a)\\n" //$NON-NLS-1$
+			+ "   except Exception:\\n" //$NON-NLS-1$
+			+ "    k=\"\"\\n" //$NON-NLS-1$
+			+ "   print(\"" + SHADOW_HELPER_TAG + "%s|%d|%d|%s\" % (s.name,s.line,s.is_argument,k))\\n" //$NON-NLS-1$ //$NON-NLS-2$
+			+ " if b.function is not None:\\n" //$NON-NLS-1$
+			+ "  break\\n" //$NON-NLS-1$
+			+ " b=b.superblock\\n" //$NON-NLS-1$
+			+ "')"; //$NON-NLS-1$
+
+	/** One line printed by {@link #SHADOW_HELPER}. */
+	private static class ShadowHelperEntry {
+		final String fName;
+		final int fLine;
+		final boolean fArgument;
+		final String fVariable;
+
+		ShadowHelperEntry(String name, int line, boolean argument, String variable) {
+			fName = name;
+			fLine = line;
+			fArgument = argument;
+			fVariable = variable;
+		}
+	}
+
+	/** Result of {@link #SHADOW_HELPER}. */
+	private static class ShadowHelperInfo extends MIInfo {
+		final List<ShadowHelperEntry> fEntries = new ArrayList<>();
+
+		ShadowHelperInfo(MIOutput record) {
+			super(record);
+			if (!isDone()) {
+				return;
+			}
+			for (MIOOBRecord oob : record.getMIOOBRecords()) {
+				if (!(oob instanceof MIConsoleStreamOutput)) {
+					continue;
+				}
+				for (String line : ((MIConsoleStreamOutput) oob).getString().split("\n")) { //$NON-NLS-1$
+					if (!line.startsWith(SHADOW_HELPER_TAG)) {
+						continue;
+					}
+					String[] parts = line.substring(SHADOW_HELPER_TAG.length()).split("\\|", -1); //$NON-NLS-1$
+					if (parts.length != 4) {
+						continue;
+					}
+					try {
+						fEntries.add(new ShadowHelperEntry(parts[0], Integer.parseInt(parts[1].trim()),
+								"1".equals(parts[2].trim()), parts[3].trim())); //$NON-NLS-1$
+					} catch (NumberFormatException e) {
+						// Ignore a line that we cannot read
+					}
+				}
+			}
+		}
+
+		/**
+		 * Finds the entry of a shadowed variable. For a local, it is the entry with
+		 * the same position among the locals with this name. For an argument, it is
+		 * the argument with this name.
+		 */
+		ShadowHelperEntry find(String name, boolean argument, int shadowIndex) {
+			int count = 0;
+			for (ShadowHelperEntry entry : fEntries) {
+				if (!entry.fName.equals(name) || entry.fArgument != argument) {
+					continue;
+				}
+				if (argument || count == shadowIndex) {
+					return entry;
+				}
+				count++;
+			}
+			return null;
+		}
+	}
+
+	/** The command that runs {@link #SHADOW_HELPER} in a frame. */
+	private static class ShadowHelperCommand extends MIInterpreterExecConsole<ShadowHelperInfo> {
+		ShadowHelperCommand(IFrameDMContext frame) {
+			super(frame, SHADOW_HELPER);
+		}
+
+		@Override
+		public ShadowHelperInfo getResult(MIOutput output) {
+			return new ShadowHelperInfo(output);
 		}
 	}
 
@@ -349,6 +521,18 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 	 * and it cleared as soon as that thread executes again.
 	 */
 	private Map<IMIExecutionDMContext, VariableData> fThreadToReturnVariable = new HashMap<>();
+
+	/** Data of the shadowed variables. It is made again after each stop. */
+	private final Map<MIVariableDMC, VariableData> fShadowedVariableData = new HashMap<>();
+
+	/** The expressions made for shadowed variables, with their display names. */
+	private final Map<String, ShadowedExpression> fShadowedExpressions = new HashMap<>();
+
+	/** Number of convenience variables made to hold a copy of a shadowed value. */
+	private int fShadowCopyCount;
+
+	/** A value that GDB can read back as a number. */
+	private static final Pattern SIMPLE_VALUE = Pattern.compile("-?(0x[0-9a-fA-F]+|[0-9][0-9.eE+-]*)|true|false"); //$NON-NLS-1$
 
 	public MIStack(DsfSession session) {
 		super(session);
@@ -796,6 +980,126 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 
 	@Override
 	public void getVariableData(IVariableDMContext variableDmc, final DataRequestMonitor<IVariableDMData> rm) {
+		if (!(variableDmc instanceof MIVariableDMC) || ((MIVariableDMC) variableDmc).getShadowIndex() == 0) {
+			getMIVariableData(variableDmc, rm);
+			return;
+		}
+
+		final MIVariableDMC miVariableDmc = (MIVariableDMC) variableDmc;
+		VariableData data = fShadowedVariableData.get(miVariableDmc);
+		if (data != null) {
+			rm.done(data);
+			return;
+		}
+		getMIVariableData(variableDmc, new DataRequestMonitor<IVariableDMData>(getExecutor(), rm) {
+			@Override
+			protected void handleSuccess() {
+				resolveShadowedVariable(miVariableDmc, (VariableData) getData(), rm);
+			}
+		});
+	}
+
+	/**
+	 * Finds a GDB expression for a shadowed variable. GDB evaluates the name of the
+	 * variable in the innermost scope, thus the name refers to a different variable.
+	 * With Python in GDB, the expression uses the address of the variable and the
+	 * display name shows the line of the declaration. Without Python, or if the
+	 * variable is not in memory, the expression is a read-only copy of the value.
+	 */
+	private void resolveShadowedVariable(final MIVariableDMC dmc, final VariableData data,
+			final DataRequestMonitor<IVariableDMData> rm) {
+		final IFrameDMContext frameDmc = DMContexts.getAncestorOfType(dmc, IFrameDMContext.class);
+		if (fTraceVisualization || !hasPython()) {
+			copyShadowedVariable(frameDmc, dmc, data, null, rm);
+			return;
+		}
+
+		fMICommandCache.execute(new ShadowHelperCommand(frameDmc),
+				new DataRequestMonitor<ShadowHelperInfo>(getExecutor(), rm) {
+					@Override
+					protected void handleCompleted() {
+						ShadowHelperEntry entry = null;
+						if (isSuccess()) {
+							entry = getData().find(data.getName(), dmc.getType() == MIVariableDMC.Type.ARGUMENT,
+									dmc.getShadowIndex());
+						}
+						if (entry != null && !entry.fVariable.isEmpty()) {
+							addShadowedVariable(dmc, data, "*$" + entry.fVariable, //$NON-NLS-1$
+									lineAlias(data.getName(), entry.fLine), false, rm);
+						} else {
+							copyShadowedVariable(frameDmc, dmc, data, entry, rm);
+						}
+					}
+				});
+	}
+
+	/**
+	 * Makes a convenience variable with a copy of the value that GDB gave in the list
+	 * of variables. The user cannot change the variable through this copy.
+	 */
+	private void copyShadowedVariable(IFrameDMContext frameDmc, final MIVariableDMC dmc, final VariableData data,
+			ShadowHelperEntry entry, final DataRequestMonitor<IVariableDMData> rm) {
+		final String alias = entry != null ? lineAlias(data.getName(), entry.fLine) : shadowAlias(dmc, data.getName());
+		final String expression = SHADOW_VARIABLE_PREFIX + "copy_" + (++fShadowCopyCount); //$NON-NLS-1$
+		String value = data.getValue();
+		if (value == null || value.isEmpty()) {
+			addShadowedVariable(dmc, data, expression, alias, true, rm);
+			return;
+		}
+
+		String firstWord = value.trim().split("\\s+", 2)[0]; //$NON-NLS-1$
+		String copy;
+		if (SIMPLE_VALUE.matcher(firstWord).matches()) {
+			copy = firstWord;
+		} else {
+			// Keep the text that GDB gave, for example the value of a struct
+			copy = '"' + value.replace("\\", "\\\\").replace("\"", "\\\"") + '"'; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+		}
+		fMICommandCache.execute(fCommandFactory.createMIDataEvaluateExpression(frameDmc, expression + " = " + copy), //$NON-NLS-1$
+				new DataRequestMonitor<MIDataEvaluateExpressionInfo>(getExecutor(), rm) {
+					@Override
+					protected void handleCompleted() {
+						addShadowedVariable(dmc, data, expression, alias, true, rm);
+					}
+				});
+	}
+
+	private void addShadowedVariable(MIVariableDMC dmc, VariableData data, String expression, String alias,
+			boolean readOnly, DataRequestMonitor<IVariableDMData> rm) {
+		fShadowedExpressions.put(expression, new ShadowedExpression(alias, readOnly));
+		VariableData shadowedData = new ShadowedVariableData(new MIArg(data.getName(), data.getValue()), expression);
+		fShadowedVariableData.put(dmc, shadowedData);
+		rm.done(shadowedData);
+	}
+
+	private static String lineAlias(String name, int line) {
+		return String.format(Messages.MIStack_ShadowedVariableLine, name, line);
+	}
+
+	private static String shadowAlias(MIVariableDMC dmc, String name) {
+		if (dmc.getType() == MIVariableDMC.Type.ARGUMENT) {
+			return String.format(Messages.MIStack_ShadowedArgument, name);
+		}
+		if (dmc.getShadowIndex() == 1) {
+			return String.format(Messages.MIStack_ShadowedVariable, name);
+		}
+		return String.format(Messages.MIStack_ShadowedVariableNumber, name, dmc.getShadowIndex());
+	}
+
+	private boolean hasPython() {
+		IGDBControl control = getServicesTracker().getService(IGDBControl.class);
+		return control != null && control.getFeatures().contains("python"); //$NON-NLS-1$
+	}
+
+	/**
+	 * @return The display name and write access of an expression made for a
+	 *         shadowed variable, or null if the expression is not one of these.
+	 */
+	ShadowedExpression getShadowedExpression(String expression) {
+		return fShadowedExpressions.get(expression);
+	}
+
+	private void getMIVariableData(IVariableDMContext variableDmc, final DataRequestMonitor<IVariableDMData> rm) {
 		if (!(variableDmc instanceof MIVariableDMC)) {
 			rm.setStatus(new Status(IStatus.ERROR, GdbPlugin.PLUGIN_ID, INVALID_HANDLE,
 					"Invalid context type " + variableDmc, null)); //$NON-NLS-1$
@@ -944,22 +1248,51 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 	}
 
 	private MIVariableDMC[] makeVariableDMCs(IFrameDMContext frame, MIVariableDMC.Type type, MIArg[] miArgs) {
-		// Use LinkedHashMap in order to keep the original ordering.
-		// We don't currently support variables with the same name in the same frame,
-		// so we only keep the first one.
-		// Bug 327621 and 328573
-		Map<String, MIVariableDMC> variableNames = new LinkedHashMap<>();
+		// GDB gives the variables of the innermost scope first. A local variable
+		// with the same name as a variable before it is shadowed (bug 327621 and 328573).
+		// Arguments cannot have the same name, thus we keep only the first one.
+		Map<String, Integer> nameCount = new HashMap<>();
+		List<MIVariableDMC> variables = new ArrayList<>();
 
 		for (int i = 0; i < miArgs.length; i++) {
 			String name = miArgs[i].getName();
-			MIVariableDMC var = variableNames.get(name);
-
-			if (var == null) {
-				variableNames.put(name, new MIVariableDMC(this, frame, type, i));
+			int count = nameCount.getOrDefault(name, 0);
+			if (count == 0 || type == MIVariableDMC.Type.LOCAL) {
+				variables.add(new MIVariableDMC(this, frame, type, i, count));
 			}
+			nameCount.put(name, count + 1);
 		}
 
-		return variableNames.values().toArray(new MIVariableDMC[0]);
+		return variables.toArray(new MIVariableDMC[0]);
+	}
+
+	/**
+	 * Marks the arguments that have the same name as a local variable. The local
+	 * variable is in an inner scope, thus it shadows the argument.
+	 */
+	private void markShadowedArguments(final IFrameDMContext frameDmc, final List<IVariableDMContext> arguments,
+			final Set<String> localNames, RequestMonitor rm) {
+		if (arguments.isEmpty() || localNames.isEmpty()) {
+			rm.done();
+			return;
+		}
+
+		CountingRequestMonitor countingRm = new CountingRequestMonitor(getExecutor(), rm);
+		countingRm.setDoneCount(arguments.size());
+		for (int i = 0; i < arguments.size(); i++) {
+			final int position = i;
+			final IVariableDMContext argument = arguments.get(i);
+			getMIVariableData(argument, new DataRequestMonitor<IVariableDMData>(getExecutor(), countingRm) {
+				@Override
+				protected void handleCompleted() {
+					if (isSuccess() && argument instanceof MIVariableDMC && localNames.contains(getData().getName())) {
+						arguments.set(position, new MIVariableDMC(MIStack.this, frameDmc, MIVariableDMC.Type.ARGUMENT,
+								((MIVariableDMC) argument).getIndex(), 1));
+					}
+					countingRm.done();
+				}
+			});
+		}
 	}
 
 	/**
@@ -983,13 +1316,23 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 	@Override
 	public void getLocals(final IFrameDMContext frameDmc, final DataRequestMonitor<IVariableDMContext[]> rm) {
 
+		final List<IVariableDMContext> returnValuesList = new ArrayList<>();
+		final List<IVariableDMContext> argumentsList = new ArrayList<>();
 		final List<IVariableDMContext> localsList = new ArrayList<>();
+		final Set<String> localNames = new HashSet<>();
 
 		final CountingRequestMonitor countingRm = new CountingRequestMonitor(getExecutor(), rm) {
 			@Override
 			protected void handleSuccess() {
-				rm.setData(localsList.toArray(new IVariableDMContext[localsList.size()]));
-				rm.done();
+				markShadowedArguments(frameDmc, argumentsList, localNames, new RequestMonitor(getExecutor(), rm) {
+					@Override
+					protected void handleSuccess() {
+						List<IVariableDMContext> all = new ArrayList<>(returnValuesList);
+						all.addAll(argumentsList);
+						all.addAll(localsList);
+						rm.done(all.toArray(new IVariableDMContext[all.size()]));
+					}
+				});
 			}
 		};
 		countingRm.setDoneCount(3);
@@ -998,7 +1341,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 		getReturnValues(frameDmc, new DataRequestMonitor<IVariableDMContext[]>(getExecutor(), countingRm) {
 			@Override
 			protected void handleSuccess() {
-				localsList.addAll(Arrays.asList(getData()));
+				returnValuesList.addAll(Arrays.asList(getData()));
 				countingRm.done();
 			}
 		});
@@ -1007,7 +1350,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 		getArguments(frameDmc, new DataRequestMonitor<IVariableDMContext[]>(getExecutor(), countingRm) {
 			@Override
 			protected void handleSuccess() {
-				localsList.addAll(Arrays.asList(getData()));
+				argumentsList.addAll(Arrays.asList(getData()));
 				countingRm.done();
 			}
 		});
@@ -1026,6 +1369,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 					protected void handleSuccess() {
 						localsList.addAll(Arrays
 								.asList(makeVariableDMCs(frameDmc, MIVariableDMC.Type.LOCAL, getData().getLocals())));
+						addNames(localNames, getData().getLocals());
 						countingRm.done();
 					}
 
@@ -1041,11 +1385,18 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 									protected void handleSuccess() {
 										localsList.addAll(Arrays.asList(makeVariableDMCs(frameDmc,
 												MIVariableDMC.Type.LOCAL, getData().getLocals())));
+										addNames(localNames, getData().getLocals());
 										countingRm.done();
 									}
 								});
 					}
 				});
+	}
+
+	private static void addNames(Set<String> names, MIArg[] variables) {
+		for (MIArg variable : variables) {
+			names.add(variable.getName());
+		}
 	}
 
 	@Override
@@ -1137,6 +1488,8 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 	@DsfServiceEventHandler
 	public void eventDispatched(IResumedDMEvent e) {
 		fMICommandCache.setContextAvailable(e.getDMContext(), false);
+		fShadowedVariableData.clear();
+		fShadowedExpressions.clear();
 		if (e.getReason() != StateChangeReason.STEP) {
 			fCachedStoppedEvent = null;
 			fMICommandCache.reset();
@@ -1177,6 +1530,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 		fMICommandCache.setContextAvailable(e.getDMContext(), true);
 		fMICommandCache.reset();
 		fFramesCache.clear();
+		fShadowedVariableData.clear();
 
 		handleReturnValues(e);
 	}
@@ -1253,6 +1607,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 		fMICommandCache.reset(context);
 		fFramesCache.clear(context);
 		fCachedStoppedEvent = null;
+		fShadowedVariableData.clear();
 	}
 
 }
