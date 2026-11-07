@@ -457,7 +457,7 @@ void testExistingChild() {
 }
 
 int testShadowing(int x) { /* testShadowing_arg */
-	int y = x + 1;
+	int y = x + 1; /* testShadowing_start */
 	{
 		int x = 20; /* testShadowing_x20 */
 		{
@@ -470,6 +470,22 @@ int testShadowing(int x) { /* testShadowing_arg */
 		y = y + 1;
 	}
 	return y;
+}
+
+int testShadowingSteps() {
+	int x = 5; /* testShadowingSteps_x5 */
+	int r = x; /* testShadowingSteps_1 */
+	{
+		int x = r + 1; /* testShadowingSteps_x6 */
+		r = x; /* testShadowingSteps_2 */
+		{
+			int x = r + 1; /* testShadowingSteps_x7 */
+			r = x; /* testShadowingSteps_3 */
+		}
+		r = x; /* testShadowingSteps_4 */
+	}
+	r = x; /* testShadowingSteps_5 */
+	return r;
 }
 
 int main() {
@@ -503,6 +519,7 @@ int main() {
     testReturn();
     testExistingChild();
     testShadowing(10);
+    testShadowingSteps();
     
     // For bug 320277
     BaseTest b; b.test();

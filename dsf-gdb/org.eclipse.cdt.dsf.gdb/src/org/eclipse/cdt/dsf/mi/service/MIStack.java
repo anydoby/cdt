@@ -528,6 +528,13 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 	/** The expressions made for shadowed variables, with their display names. */
 	private final Map<String, ShadowedExpression> fShadowedExpressions = new HashMap<>();
 
+	/**
+	 * The visible variables that hide a variable with the same name. GDB binds a
+	 * variable object to the variable that was visible when the object was made,
+	 * thus CDT also reads these variables through their address.
+	 */
+	private final Set<MIVariableDMC> fHidingVariables = new HashSet<>();
+
 	/** Number of convenience variables made to hold a copy of a shadowed value. */
 	private int fShadowCopyCount;
 
@@ -980,7 +987,8 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 
 	@Override
 	public void getVariableData(IVariableDMContext variableDmc, final DataRequestMonitor<IVariableDMData> rm) {
-		if (!(variableDmc instanceof MIVariableDMC) || ((MIVariableDMC) variableDmc).getShadowIndex() == 0) {
+		if (!(variableDmc instanceof MIVariableDMC)
+				|| (((MIVariableDMC) variableDmc).getShadowIndex() == 0 && !fHidingVariables.contains(variableDmc))) {
 			getMIVariableData(variableDmc, rm);
 			return;
 		}
@@ -1009,6 +1017,12 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 	private void resolveShadowedVariable(final MIVariableDMC dmc, final VariableData data,
 			final DataRequestMonitor<IVariableDMData> rm) {
 		final IFrameDMContext frameDmc = DMContexts.getAncestorOfType(dmc, IFrameDMContext.class);
+		final boolean visible = dmc.getShadowIndex() == 0;
+		if (visible && (fTraceVisualization || !hasPython())) {
+			// Use the name. GDB can show an old value if it reuses a variable object.
+			rm.done(data);
+			return;
+		}
 		if (fTraceVisualization || !hasPython()) {
 			copyShadowedVariable(frameDmc, dmc, data, null, rm);
 			return;
@@ -1025,7 +1039,9 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 						}
 						if (entry != null && !entry.fVariable.isEmpty()) {
 							addShadowedVariable(dmc, data, "*$" + entry.fVariable, //$NON-NLS-1$
-									lineAlias(data.getName(), entry.fLine), false, rm);
+									visible ? data.getName() : lineAlias(data.getName(), entry.fLine), false, rm);
+						} else if (visible) {
+							rm.done(data);
 						} else {
 							copyShadowedVariable(frameDmc, dmc, data, entry, rm);
 						}
@@ -1271,7 +1287,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 	 * variable is in an inner scope, thus it shadows the argument.
 	 */
 	private void markShadowedArguments(final IFrameDMContext frameDmc, final List<IVariableDMContext> arguments,
-			final Set<String> localNames, RequestMonitor rm) {
+			final Map<String, MIVariableDMC> localNames, RequestMonitor rm) {
 		if (arguments.isEmpty() || localNames.isEmpty()) {
 			rm.done();
 			return;
@@ -1285,9 +1301,11 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 			getMIVariableData(argument, new DataRequestMonitor<IVariableDMData>(getExecutor(), countingRm) {
 				@Override
 				protected void handleCompleted() {
-					if (isSuccess() && argument instanceof MIVariableDMC && localNames.contains(getData().getName())) {
+					if (isSuccess() && argument instanceof MIVariableDMC
+							&& localNames.containsKey(getData().getName())) {
 						arguments.set(position, new MIVariableDMC(MIStack.this, frameDmc, MIVariableDMC.Type.ARGUMENT,
 								((MIVariableDMC) argument).getIndex(), 1));
+						fHidingVariables.add(localNames.get(getData().getName()));
 					}
 					countingRm.done();
 				}
@@ -1319,7 +1337,8 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 		final List<IVariableDMContext> returnValuesList = new ArrayList<>();
 		final List<IVariableDMContext> argumentsList = new ArrayList<>();
 		final List<IVariableDMContext> localsList = new ArrayList<>();
-		final Set<String> localNames = new HashSet<>();
+		// The visible local variable for each name
+		final Map<String, MIVariableDMC> localNames = new HashMap<>();
 
 		final CountingRequestMonitor countingRm = new CountingRequestMonitor(getExecutor(), rm) {
 			@Override
@@ -1369,7 +1388,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 					protected void handleSuccess() {
 						localsList.addAll(Arrays
 								.asList(makeVariableDMCs(frameDmc, MIVariableDMC.Type.LOCAL, getData().getLocals())));
-						addNames(localNames, getData().getLocals());
+						addNames(localNames, localsList, getData().getLocals());
 						countingRm.done();
 					}
 
@@ -1385,7 +1404,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 									protected void handleSuccess() {
 										localsList.addAll(Arrays.asList(makeVariableDMCs(frameDmc,
 												MIVariableDMC.Type.LOCAL, getData().getLocals())));
-										addNames(localNames, getData().getLocals());
+										addNames(localNames, localsList, getData().getLocals());
 										countingRm.done();
 									}
 								});
@@ -1393,9 +1412,26 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 				});
 	}
 
-	private static void addNames(Set<String> names, MIArg[] variables) {
-		for (MIArg variable : variables) {
-			names.add(variable.getName());
+	/**
+	 * Adds the visible local variables to the map of names, and remembers the
+	 * visible variables that hide a variable with the same name.
+	 */
+	private void addNames(Map<String, MIVariableDMC> names, List<IVariableDMContext> locals, MIArg[] variables) {
+		for (IVariableDMContext local : locals) {
+			if (!(local instanceof MIVariableDMC)) {
+				continue;
+			}
+			MIVariableDMC dmc = (MIVariableDMC) local;
+			if (dmc.getIndex() >= variables.length) {
+				continue;
+			}
+			String name = variables[dmc.getIndex()].getName();
+			MIVariableDMC visible = names.get(name);
+			if (dmc.getShadowIndex() == 0) {
+				names.put(name, dmc);
+			} else if (visible != null) {
+				fHidingVariables.add(visible);
+			}
 		}
 	}
 
@@ -1531,6 +1567,7 @@ public class MIStack extends AbstractDsfService implements IStack, ICachingServi
 		fMICommandCache.reset();
 		fFramesCache.clear();
 		fShadowedVariableData.clear();
+		fHidingVariables.clear();
 
 		handleReturnValues(e);
 	}

@@ -641,8 +641,14 @@ public class MIExpressionsTest extends BaseParametrizedTestCase {
 		String argument = "x (line " + getLineForTag("testShadowing_arg") + ")";
 		String x20 = "x (line " + getLineForTag("testShadowing_x20") + ")";
 
-		MIStoppedEvent stoppedEvent = runToTag("testShadowing_inner");
+		// Read the variables before the inner variables are visible. GDB binds the
+		// variable object of "x" to the argument.
+		MIStoppedEvent stoppedEvent = runToTag("testShadowing_start");
 		IFrameDMContext frameDmc = SyncUtil.getStackFrame(stoppedEvent.getDMContext(), 0);
+		assertEquals("10", getLocalsByDisplayName(frameDmc).get("x"));
+
+		stoppedEvent = runToTag("testShadowing_inner");
+		frameDmc = SyncUtil.getStackFrame(stoppedEvent.getDMContext(), 0);
 
 		Map<String, String> expected = new LinkedHashMap<>();
 		expected.put(argument, "10");
@@ -664,6 +670,58 @@ public class MIExpressionsTest extends BaseParametrizedTestCase {
 		expected.put("x", "25");
 		expected.put("y", "55");
 		assertEquals(expected, getLocalsByDisplayName(frameDmc));
+	}
+
+	/**
+	 * Runs to a tag and returns the display name and value of each variable "x".
+	 */
+	private Map<String, String> getXVariablesAtTag(String tag) throws Throwable {
+		MIStoppedEvent stoppedEvent = runToTag(tag);
+		IFrameDMContext frameDmc = SyncUtil.getStackFrame(stoppedEvent.getDMContext(), 0);
+		Map<String, String> result = new HashMap<>();
+		for (Entry<String, String> entry : getLocalsByDisplayName(frameDmc).entrySet()) {
+			if (entry.getKey().equals("x") || entry.getKey().startsWith("x (")) {
+				result.put(entry.getKey(), entry.getValue());
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * This test goes into two nested blocks that each declare a new "x", and out
+	 * of them again. At each stop, "x" must be the innermost variable, and each
+	 * hidden variable must show the line of its declaration and its own value.
+	 */
+	@Test
+	public void testShadowedVariablesWhileStepping() throws Throwable {
+		String x5 = "x (line " + getLineForTag("testShadowingSteps_x5") + ")";
+		String x6 = "x (line " + getLineForTag("testShadowingSteps_x6") + ")";
+
+		Map<String, String> expected = new HashMap<>();
+		expected.put("x", "5");
+		assertEquals(expected, getXVariablesAtTag("testShadowingSteps_1"));
+
+		expected = new HashMap<>();
+		expected.put("x", "6");
+		expected.put(x5, "5");
+		assertEquals(expected, getXVariablesAtTag("testShadowingSteps_2"));
+
+		expected = new HashMap<>();
+		expected.put("x", "7");
+		expected.put(x6, "6");
+		expected.put(x5, "5");
+		assertEquals(expected, getXVariablesAtTag("testShadowingSteps_3"));
+
+		// Out of the innermost block
+		expected = new HashMap<>();
+		expected.put("x", "6");
+		expected.put(x5, "5");
+		assertEquals(expected, getXVariablesAtTag("testShadowingSteps_4"));
+
+		// Out of both blocks
+		expected = new HashMap<>();
+		expected.put("x", "5");
+		assertEquals(expected, getXVariablesAtTag("testShadowingSteps_5"));
 	}
 
 	/**
