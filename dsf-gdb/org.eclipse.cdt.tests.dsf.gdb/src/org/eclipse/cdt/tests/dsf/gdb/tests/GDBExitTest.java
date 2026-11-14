@@ -20,10 +20,16 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.eclipse.cdt.debug.core.ICDTLaunchConfigurationConstants;
+import org.eclipse.cdt.dsf.debug.service.command.ICommandListener;
+import org.eclipse.cdt.dsf.debug.service.command.ICommandResult;
+import org.eclipse.cdt.dsf.debug.service.command.ICommandToken;
 import org.eclipse.cdt.dsf.gdb.IGDBLaunchConfigurationConstants;
 import org.eclipse.cdt.dsf.gdb.service.IGDBBackend;
+import org.eclipse.cdt.dsf.gdb.service.command.IGDBControl;
+import org.eclipse.cdt.dsf.mi.service.command.commands.MIGDBExit;
 import org.eclipse.cdt.dsf.service.DsfServicesTracker;
 import org.eclipse.cdt.dsf.service.DsfSession;
 import org.eclipse.cdt.tests.dsf.gdb.framework.BaseParametrizedTestCase;
@@ -44,6 +50,7 @@ public class GDBExitTest extends BaseParametrizedTestCase {
 
 	private Process fAttachedProgram;
 	private IGDBBackend fBackend;
+	private final AtomicBoolean fGdbExitDone = new AtomicBoolean();
 
 	@Override
 	public void doBeforeTest() throws Exception {
@@ -60,6 +67,27 @@ public class GDBExitTest extends BaseParametrizedTestCase {
 		fBackend = session.getExecutor().submit(() -> {
 			DsfServicesTracker tracker = new DsfServicesTracker(TestsPlugin.getBundleContext(), session.getId());
 			try {
+				// Record whether GDB answered -gdb-exit, or the force-quit timer destroyed it before
+				tracker.getService(IGDBControl.class).addCommandListener(new ICommandListener() {
+					@Override
+					public void commandQueued(ICommandToken token) {
+					}
+
+					@Override
+					public void commandSent(ICommandToken token) {
+					}
+
+					@Override
+					public void commandRemoved(ICommandToken token) {
+					}
+
+					@Override
+					public void commandDone(ICommandToken token, ICommandResult result) {
+						if (token.getCommand() instanceof MIGDBExit) {
+							fGdbExitDone.set(true);
+						}
+					}
+				});
 				return tracker.getService(IGDBBackend.class);
 			} finally {
 				tracker.dispose();
@@ -164,12 +192,18 @@ public class GDBExitTest extends BaseParametrizedTestCase {
 			getGDBLaunch().terminate();
 			assertLaunchTerminates();
 			assertTrue("GDB did not exit", gdb.waitFor(TIMEOUT_MS, TimeUnit.MILLISECONDS)); //$NON-NLS-1$
+			assertTrue("GDB was destroyed before -gdb-exit", fGdbExitDone.get()); //$NON-NLS-1$
 		} finally {
-			// A hung GDB ignores SIGTERM. Also stop the program that GDB started.
-			ProcessHandle.of(gdb.pid()).ifPresent(handle -> {
-				handle.descendants().forEach(ProcessHandle::destroyForcibly);
-				handle.destroyForcibly();
-			});
+			if (runningOnWindows()) {
+				// The Spawner's pid() is not the native process ID on Windows
+				gdb.destroy();
+			} else {
+				// A hung GDB ignores SIGTERM. Also stop the program that GDB started.
+				ProcessHandle.of(gdb.pid()).ifPresent(handle -> {
+					handle.descendants().forEach(ProcessHandle::destroyForcibly);
+					handle.destroyForcibly();
+				});
+			}
 		}
 	}
 
